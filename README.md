@@ -47,3 +47,17 @@ PYTHONPATH=src python3 -m silicon_qualification.api --database silicon.sqlite3 -
 ```
 
 服务均提供 `GET /health`，其余接口使用 JSON。进程重启后可以继续查询 SQLite 中的业务状态和审计历史。
+
+## 服务日容量口径
+
+线路容量按**起点机房时区的自然日**（当地 00:00 到次日 00:00，半开区间）作为租户服务日统一边界：维护窗口、机房时区和提名的 `service_date` 使用同一套 UTC 区间。维护只按与服务日真正重叠的时长折算；跨午夜维护拆分到相邻两个服务日，开放式维护（无 `ends_at`）持续生效；同一时段多段维护按 `capacity_percent` 连乘，计算结果与登记顺序无关。
+
+查询某服务日的原始容量、每段降容的重叠时长与损失贡献、分段明细和最终可分配量：
+
+```bash
+curl -H 'X-Actor-Id: audit' \
+  'http://127.0.0.1:8080/routes/fabric-wlmq-east/capacity?service_date=2026-09-25'
+```
+
+重复执行 `POST /routes/{route_id}/allocate` 且输入不变时返回已存储的同一结果（`replayed: true`），不新增运行记录、不改写历史预约；只有出现新的待分配提名导致输入变化时才会产生新的分配运行。
+

@@ -1,9 +1,10 @@
-"""可注入的 UTC 时间源。"""
+"""可注入的 UTC 时间源与机房时区解析。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class SystemClock:
@@ -38,3 +39,14 @@ def parse_utc(value: str, field: str = "时间") -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"{field} 必须包含时区")
     return parsed.astimezone(timezone.utc)
+
+
+def load_timezone(name: str) -> tzinfo:
+    """把设施登记的时区名解析为 tzinfo；非法名称抛出 ValueError。"""
+    text = name.strip()
+    if text.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"时区 {text} 不是有效的 IANA 时区") from exc

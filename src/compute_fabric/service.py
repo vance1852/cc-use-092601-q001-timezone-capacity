@@ -7,9 +7,9 @@ import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import SystemClock, load_timezone, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
@@ -20,12 +20,17 @@ from .planning import (
     decimal_text,
     delivered_after_loss,
     digest,
-    effective_capacity,
     latest_streak,
     moving_average,
     quantize_volume,
     scenario_projection,
     weighted_inventory_cost,
+)
+from .service_day import (
+    OutageWindow,
+    ServiceDayCapacity,
+    service_day_capacity,
+    service_day_window_utc,
 )
 from .storage import initialize, transaction
 
@@ -178,6 +183,10 @@ class SupplyService:
     def create_facility(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "catalog.write")
         facility = Facility.from_dict(raw)
+        try:
+            load_timezone(facility.timezone)
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
@@ -345,28 +354,68 @@ class SupplyService:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
-        start = service_date + "T00:00:00Z"
-        end = service_date + "T23:59:59Z"
+    def _route_row(self, route_id: str) -> sqlite3.Row:
+        route = self.connection.execute(
+            "SELECT r.*, f.timezone AS origin_timezone FROM routes r "
+            "JOIN facilities f ON f.facility_id=r.origin_id WHERE r.route_id=?",
+            (route_id,),
+        ).fetchone()
+        if route is None:
+            raise NotFound("互联通道不存在")
+        return route
+
+    def service_day_report(self, route_id: str, service_date: str) -> dict[str, Any]:
+        """解释某个服务日的原始容量、每段降容的重叠贡献与最终可分配量。"""
+        route = self._route_row(route_id)
+        capacity = self._capacity_for_date(route, route["origin_timezone"], service_date)
+        return capacity.as_dict()
+
+    def _capacity_for_date(
+        self, route: sqlite3.Row, timezone_name: str, service_date: str
+    ) -> ServiceDayCapacity:
+        window_start, window_end = service_day_window_utc(service_date, timezone_name)
+        # SQL 预筛选放宽 1 秒（字符串比较对带小数的秒不精确），精确重叠由 service_day_capacity 裁剪
+        margin = timedelta(seconds=1)
         rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
-            "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
-            (route["route_id"], end, start),
+            "SELECT outage_id,starts_at,ends_at,capacity_percent FROM route_outages "
+            "WHERE route_id=? AND state IN ('announced','active') "
+            "AND starts_at < ? AND (ends_at IS NULL OR ends_at > ?) ORDER BY outage_id",
+            (route["route_id"], utc_text(window_end + margin), utc_text(window_start - margin)),
         ).fetchall()
-        percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+        windows = [
+            OutageWindow(
+                outage_id=int(row["outage_id"]),
+                starts_at=parse_utc(row["starts_at"], "starts_at"),
+                ends_at=None if row["ends_at"] is None else parse_utc(row["ends_at"], "ends_at"),
+                capacity_percent=Decimal(row["capacity_percent"]),
+            )
+            for row in rows
+        ]
+        return service_day_capacity(
+            Decimal(route["daily_capacity"]), service_date, timezone_name, windows
+        )
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
         self._require(actor_id, "allocation.run")
-        route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
-        if route is None:
-            raise NotFound("互联通道不存在")
+        route = self._route_row(route_id)
         nominations = self.connection.execute(
             "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
             "ORDER BY priority,submitted_at,nomination_id",
             (route_id, service_date),
         ).fetchall()
         if not nominations:
+            # 服务日已分配过：重放最近一次运行结果，历史预约保持不变。
+            existing = self.connection.execute(
+                "SELECT allocation_id,result_json FROM allocation_runs "
+                "WHERE route_id=? AND service_date=? ORDER BY allocation_id DESC LIMIT 1",
+                (route_id, service_date),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "allocation_id": existing["allocation_id"],
+                    **json.loads(existing["result_json"]),
+                    "replayed": True,
+                }
             raise InvalidState("没有待分配提名")
         requests = [
             AllocationRequest(
@@ -377,9 +426,26 @@ class SupplyService:
             )
             for row in nominations
         ]
-        available = self._capacity_for_date(route, service_date)
+        capacity = self._capacity_for_date(route, route["origin_timezone"], service_date)
+        available = capacity.effective_gpu_hours
         input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
+        input_sha256 = digest({
+            "route": dict(route),
+            "nominations": input_value,
+            "capacity": str(available),
+            "service_day": {
+                "timezone": capacity.timezone_name,
+                "window_start_utc": utc_text(capacity.window_start_utc),
+                "window_end_utc": utc_text(capacity.window_end_utc),
+            },
+        })
+        existing = self.connection.execute(
+            "SELECT allocation_id,result_json FROM allocation_runs "
+            "WHERE route_id=? AND service_date=? AND input_sha256=?",
+            (route_id, service_date, input_sha256),
+        ).fetchone()
+        if existing is not None:
+            return {"allocation_id": existing["allocation_id"], **json.loads(existing["result_json"]), "replayed": True}
         result_rows = allocate_capacity(available, requests)
         result = {
             "route_id": route_id,
@@ -402,7 +468,7 @@ class SupplyService:
                 )
             allocation_id = int(cursor.lastrowid)
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+        return {"allocation_id": allocation_id, **result, "replayed": False}
 
     def dispatch_transfer(
         self,

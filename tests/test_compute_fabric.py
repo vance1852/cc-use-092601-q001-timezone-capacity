@@ -5,13 +5,18 @@ import sqlite3
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
+from compute_fabric import acceptance
 from compute_fabric.api import JsonApplication
 from compute_fabric.clock import FrozenClock
-from compute_fabric.errors import Conflict, Forbidden
+from compute_fabric.errors import Conflict, Forbidden, ValidationFailed
 from compute_fabric.planning import AllocationRequest, PricePoint, allocate_capacity, latest_streak
 from compute_fabric.service import SupplyService
 from compute_fabric.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class PlanningTests(unittest.TestCase):
@@ -94,7 +99,8 @@ class SupplyServiceTests(unittest.TestCase):
             self.service.submit_nomination("dispatch", changed)
 
     def test_outage_reduces_allocation_and_transfer_consumes_inventory(self) -> None:
-        self.service.announce_outage("risk", "fabric-a-b", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "检修")
+        # 覆盖上海时区服务日 2026-09-25 全天（当地 00:00 到 24:00）的 50% 降容
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-24T16:00:00Z", "2026-09-25T16:00:00Z", "50", "检修")
         for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
             self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "fabric-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_gpu_hours": requested, "priority": priority, "idempotency_key": f"key-{number}"})
         allocation = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
@@ -123,12 +129,109 @@ class SupplyServiceTests(unittest.TestCase):
         self.connection.execute("UPDATE supply_audit_events SET payload_json='{}' WHERE event_id=1")
         self.assertFalse(self.service.audit_chain("audit")["valid"])
 
+    def test_service_day_follows_origin_timezone_and_splits_cross_midnight_outage(self) -> None:
+        self.service.create_facility("plan", {"facility_id": "cluster-wlmq", "name": "乌鲁木齐数据中心", "kind": "storage", "timezone": "Asia/Urumqi", "capacity_gpu_hours": "600000"})
+        self.service.create_route("plan", {"route_id": "fabric-wlmq-sh", "origin_id": "cluster-wlmq", "destination_id": "pool-b", "product": "gpu-h100", "daily_capacity": "24000", "loss_basis_points": 0, "transit_hours": 48})
+        # 乌鲁木齐当地 2026-09-24 23:30 至 2026-09-25 00:30（UTC 17:30-18:30）的 50% 降容
+        self.service.announce_outage("risk", "fabric-wlmq-sh", "2026-09-24T17:30:00Z", "2026-09-24T18:30:00Z", "50", "线路维护")
+        day_before = self.service.service_day_report("fabric-wlmq-sh", "2026-09-24")
+        day_of = self.service.service_day_report("fabric-wlmq-sh", "2026-09-25")
+        day_after = self.service.service_day_report("fabric-wlmq-sh", "2026-09-26")
+        # 服务日边界与机房时区一致：当地午夜对应 18:00Z，而不是 00:00Z
+        self.assertEqual(day_of["timezone"], "Asia/Urumqi")
+        self.assertEqual(day_of["window_start_utc"], "2026-09-24T18:00:00Z")
+        self.assertEqual(day_of["window_end_utc"], "2026-09-25T18:00:00Z")
+        self.assertEqual(day_of["nominal_gpu_hours"], "24000.000")
+        # 跨午夜的 1 小时维护只在相邻两个服务日各计真正重叠的 30 分钟
+        self.assertEqual(day_before["effective_gpu_hours"], "23750.000")
+        self.assertEqual(day_of["effective_gpu_hours"], "23750.000")
+        self.assertEqual(day_after["effective_gpu_hours"], "24000.000")
+        self.assertEqual(day_of["lost_gpu_hours"], "250.000")
+        self.assertEqual(len(day_of["outages"]), 1)
+        self.assertEqual(day_of["outages"][0]["overlap_hours"], "0.500")
+        self.assertEqual(day_of["outages"][0]["lost_gpu_hours"], "250.000")
+
+    def test_open_ended_outage_remains_active(self) -> None:
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-27T00:00:00Z", None, "75", "开放式检修")
+        before = self.service.service_day_report("fabric-a-b", "2026-09-26")
+        after = self.service.service_day_report("fabric-a-b", "2026-09-28")
+        later = self.service.service_day_report("fabric-a-b", "2026-10-05")
+        self.assertEqual(before["effective_gpu_hours"], "100000.000")
+        self.assertEqual(after["effective_gpu_hours"], "75000.000")
+        self.assertEqual(later["effective_gpu_hours"], "75000.000")
+
+    def test_overlapping_outages_compound_and_report_is_stable(self) -> None:
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-24T20:00:00Z", "2026-09-24T22:00:00Z", "50", "检修一")
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-24T21:00:00Z", "2026-09-24T23:00:00Z", "50", "检修二")
+        first = self.service.service_day_report("fabric-a-b", "2026-09-25")
+        second = self.service.service_day_report("fabric-a-b", "2026-09-25")
+        self.assertEqual(first, second)
+        # 20:00-21:00 与 22:00-23:00 各按 50% 计，21:00-22:00 两段连乘为 25%
+        self.assertEqual(first["effective_gpu_hours"], "92708.333")
+        self.assertEqual([item["overlap_hours"] for item in first["outages"]], ["2.000", "2.000"])
+        self.assertEqual([item["lost_gpu_hours"] for item in first["outages"]], ["3645.833", "3645.833"])
+
+    def test_allocate_replay_returns_stored_result_without_rewriting_history(self) -> None:
+        for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
+            self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "fabric-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_gpu_hours": requested, "priority": priority, "idempotency_key": f"key-{number}"})
+        first = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        self.assertFalse(first["replayed"])
+        nominations_before = [dict(row) for row in self.connection.execute("SELECT * FROM nominations ORDER BY nomination_id").fetchall()]
+        audit_events_before = self.service.audit_chain("audit")["events"]
+        second = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["allocation_id"], first["allocation_id"])
+        self.assertEqual(second["allocations"], first["allocations"])
+        self.assertEqual(second["available_capacity"], first["available_capacity"])
+        nominations_after = [dict(row) for row in self.connection.execute("SELECT * FROM nominations ORDER BY nomination_id").fetchall()]
+        self.assertEqual(nominations_after, nominations_before)
+        self.assertEqual(self.service.audit_chain("audit")["events"], audit_events_before)
+        runs = self.connection.execute("SELECT * FROM allocation_runs WHERE route_id='fabric-a-b' AND service_date='2026-09-25'").fetchall()
+        self.assertEqual(len(runs), 1)
+
+    def test_facility_rejects_unknown_timezone(self) -> None:
+        with self.assertRaises(ValidationFailed):
+            self.service.create_facility("plan", {"facility_id": "bad-tz", "name": "未知时区机房", "kind": "storage", "timezone": "Mars/Olympus", "capacity_gpu_hours": "1"})
+
+    def test_api_service_day_report(self) -> None:
+        app = JsonApplication(self.service)
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-24T20:00:00Z", "2026-09-24T22:00:00Z", "50", "检修")
+        response = app.handle("GET", "/routes/fabric-a-b/capacity?service_date=2026-09-25", {"X-Actor-Id": "audit"})
+        self.assertEqual(response.status, 200)
+        body = response.body
+        self.assertEqual(body["timezone"], "Asia/Shanghai")
+        self.assertEqual(body["window_start_utc"], "2026-09-24T16:00:00Z")
+        self.assertEqual(body["window_end_utc"], "2026-09-25T16:00:00Z")
+        self.assertEqual(body["nominal_gpu_hours"], "100000.000")
+        self.assertEqual(len(body["outages"]), 1)
+        self.assertTrue(body["segments"])
+        missing = app.handle("GET", "/routes/fabric-a-b/capacity", {"X-Actor-Id": "audit"})
+        self.assertEqual(missing.status, 422)
+        unknown = app.handle("GET", "/routes/nope/capacity?service_date=2026-09-25", {"X-Actor-Id": "audit"})
+        self.assertEqual(unknown.status, 404)
+
     def test_api_exposes_browser_free_boundary(self) -> None:
         app = JsonApplication(self.service)
         self.assertEqual(app.handle("GET", "/health").status, 200)
         response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
         self.assertEqual(response.status, 404)
         self.assertEqual(response.body["error"]["code"], "not_found")
+
+
+class AcceptanceFlowTests(unittest.TestCase):
+    def test_offline_acceptance_explains_service_days(self) -> None:
+        result = acceptance.run(ROOT)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["audit"]["valid"])
+        day_of = result["service_days"]["wlmq_2026-09-25"]
+        self.assertEqual(day_of["window_start_utc"], "2026-09-24T18:00:00Z")
+        self.assertEqual(day_of["effective_gpu_hours"], "23750.000")
+        self.assertEqual(day_of["outages"][0]["overlap_hours"], "0.500")
+        open_ended = result["service_days"]["shanghai_open_ended_2026-09-28"]
+        self.assertEqual(open_ended["effective_gpu_hours"], "80000.000")
+        self.assertEqual(result["wlmq_allocation"]["available_capacity"], "23750.000")
+        self.assertTrue(result["wlmq_replay"]["replayed"])
+        self.assertEqual(result["wlmq_replay"]["allocation_id"], result["wlmq_allocation"]["allocation_id"])
 
 
 if __name__ == "__main__":

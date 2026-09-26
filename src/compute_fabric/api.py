@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
@@ -67,6 +67,8 @@ class JsonApplication:
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
                 return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "capacity":
+                return Response(200, self.service.service_day_report(parts[1], query.get("service_date", [""])[0]))
             if method == "POST" and path == "/inventory/lots":
                 return Response(201, self.service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":
@@ -126,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    # 单连接 SQLite 按请求串行处理，避免跨线程共享连接
+    server = HTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
