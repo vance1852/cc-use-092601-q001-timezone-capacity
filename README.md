@@ -47,3 +47,20 @@ PYTHONPATH=src python3 -m silicon_qualification.api --database silicon.sqlite3 -
 ```
 
 服务均提供 `GET /health`，其余接口使用 JSON。进程重启后可以继续查询 SQLite 中的业务状态和审计历史。
+
+## 服务日容量边界
+
+服务日（`service_date`）按互联通道**起点机房**的 IANA 时区解释为当地日历日半开区间 `[00:00, 次日 00:00)`，维护窗口以绝对 UTC 时刻登记后统一裁剪到该边界，因此机房时区、线路维护窗口和租户服务日共用同一套口径：
+
+- 跨午夜（跨 UTC 自然日）维护只按与服务日真正重叠的时长加权扣减，并自动拆分到两个服务日；
+- 开放式维护（不填 `ends_at`）从生效时刻起持续覆盖之后每一个服务日；
+- 同一时段叠加多段维护时容量百分比相乘，时间片按 `outage_id` 固定切分，重复计算结果稳定；
+- 事后补登记维护只改变之后的解释与分配结果，`allocation_runs`（含 `explanation_json`）和历史预约落库状态不会被静默重算或改写。
+
+后台可通过以下接口解释任意服务日的原始容量、每段降容的重叠时长/比例、时间片明细与最终可分配量（planner/dispatcher/risk/auditor 均可查询）：
+
+```bash
+curl -H 'X-Actor-Id: audit' \
+  'http://127.0.0.1:8080/routes/<route_id>/capacity?service_date=2026-09-25'
+```
+

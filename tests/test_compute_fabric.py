@@ -94,7 +94,9 @@ class SupplyServiceTests(unittest.TestCase):
             self.service.submit_nomination("dispatch", changed)
 
     def test_outage_reduces_allocation_and_transfer_consumes_inventory(self) -> None:
-        self.service.announce_outage("risk", "fabric-a-b", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "检修")
+        # 服务日按起点机房 Asia/Shanghai 划分（UTC 16:00 到次日 UTC 16:00），
+        # 降容窗口完整覆盖该服务日才按全天 50% 计入。
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-24T16:00:00Z", "2026-09-25T16:00:00Z", "50", "检修")
         for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
             self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "fabric-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_gpu_hours": requested, "priority": priority, "idempotency_key": f"key-{number}"})
         allocation = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")

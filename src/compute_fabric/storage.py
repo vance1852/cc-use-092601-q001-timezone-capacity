@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     service_date TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
     available_capacity TEXT NOT NULL,
+    explanation_json TEXT,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
@@ -198,7 +199,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +210,13 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # 旧库迁移：allocation_runs 增加服务日容量解释列；历史记录保持原值，不重算不改写。
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(allocation_runs)").fetchall()
+    }
+    if "explanation_json" not in columns:
+        connection.execute("ALTER TABLE allocation_runs ADD COLUMN explanation_json TEXT")
 
 
 @contextmanager
